@@ -294,12 +294,20 @@ func (p *Provider) gitLs(ctx context.Context, args ...string) ([]string, error) 
 }
 
 // filterByPaths keeps only entries whose path equals a user-supplied path
-// (for exact files) or lies under it (for directories).
+// (for exact files) or lies under it (for directories). Matching ignores case,
+// like every other user-facing path filter in OCR (--include/--exclude, secret
+// paths, the extension allowlist): on Windows and macOS `--path SRC` names an
+// existing directory, and a byte-exact compare would silently select nothing.
 func filterByPaths(all []string, paths []string) []string {
+	folded := make([]string, 0, len(paths))
+	for _, want := range paths {
+		folded = append(folded, strings.ToLower(want))
+	}
 	var out []string
 	for _, f := range all {
-		for _, want := range paths {
-			if f == want || strings.HasPrefix(f, want+"/") {
+		lower := strings.ToLower(f)
+		for _, want := range folded {
+			if lower == want || strings.HasPrefix(lower, want+"/") {
 				out = append(out, f)
 				break
 			}
