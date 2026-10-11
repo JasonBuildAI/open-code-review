@@ -1,1 +1,2 @@
 - claim: codex/agent-20261011-main | 2026-10-11T21:22:43+08:00 | 旧PR: none | 缺陷: ocr scan --path 选择器按大小写精确匹配，Windows/macOS 用户输入与磁盘拼写大小写不同的存在路径时静默选中 0 个文件（其余用户路径过滤器均为大小写不敏感） | 文件: internal/scan/provider.go,internal/scan/provider_paths_test.go | issue: #0 待回填
+- claim: jx9 | 2026-10-11T21:22:56+08:00 | 旧PR: #1416 | 缺陷: cmd/opencodereview tests write session files into the real ~/.opencodereview on Windows (os.UserHomeDir reads USERPROFILE, not HOME) | 文件: cmd/opencodereview/testmain_test.go | issue: #1706, pr: #1707
