@@ -222,54 +222,103 @@ func TestProvider_Enumerate_WindowsBackslashSelector(t *testing.T) {
 	}
 }
 
-// TestFilterByPaths_CaseInsensitive pins the selector rule: a --path selector
-// names a path, and OCR matches user-facing path filters without regard to
-// case (--include/--exclude, secret paths, the extension allowlist all fold
-// case). filterByPaths was the one byte-exact holdout, so on Windows and macOS
-// `--path SRC` -- a spelling the filesystem resolves to `src` -- silently
-// selected nothing.
-func TestFilterByPaths_CaseInsensitive(t *testing.T) {
-	all := []string{
-		"README.md",
-		"SRC/Keep.go",
-		"internal/scan/provider.go",
-	}
+// TestFilterByPaths_CaseHandling pins the selector rule: a --path selector
+// names a path, so its own spelling wins -- on a case-sensitive filesystem
+// `src` does not also select a sibling `SRC/`. Only a selector that matches no
+// tracked path in its own spelling falls back to matching without regard to
+// case, like OCR's other user-facing path filters (--include/--exclude, secret
+// paths, the extension allowlist). That fallback is what keeps `--path SRC`
+// from silently selecting nothing on Windows and macOS, where the filesystem
+// resolves `SRC` to `src`.
+func TestFilterByPaths_CaseHandling(t *testing.T) {
 	tests := []struct {
 		name  string
+		all   []string
 		paths []string
 		want  []string
 	}{
-		{"directory selector in another case", []string{"SRC"}, []string{"SRC/Keep.go"}},
-		{"file selector in another case", []string{"src/keep.go"}, []string{"SRC/Keep.go"}},
-		{"mixed-case file selector", []string{"internal/SCAN/Provider.GO"}, []string{"internal/scan/provider.go"}},
-		{"partial name is not a match", []string{"src/kee"}, nil},
-		{"prefix still needs a path boundary", []string{"internal/sc"}, nil},
-		{"no match", []string{"does/not/exist"}, nil},
+		{
+			name:  "directory selector in another case",
+			all:   []string{"README.md", "SRC/Keep.go", "internal/scan/provider.go"},
+			paths: []string{"src"},
+			want:  []string{"SRC/Keep.go"},
+		},
+		{
+			name:  "file selector in another case",
+			all:   []string{"SRC/Keep.go"},
+			paths: []string{"src/keep.go"},
+			want:  []string{"SRC/Keep.go"},
+		},
+		{
+			name:  "mixed-case file selector",
+			all:   []string{"internal/scan/provider.go"},
+			paths: []string{"internal/SCAN/Provider.GO"},
+			want:  []string{"internal/scan/provider.go"},
+		},
+		{
+			name:  "partial name is not a match",
+			all:   []string{"SRC/Keep.go"},
+			paths: []string{"src/kee"},
+			want:  nil,
+		},
+		{
+			name:  "prefix still needs a path boundary",
+			all:   []string{"internal/scan/provider.go"},
+			paths: []string{"internal/sc"},
+			want:  nil,
+		},
+		{
+			name:  "no match",
+			all:   []string{"SRC/Keep.go"},
+			paths: []string{"does/not/exist"},
+			want:  nil,
+		},
+		{
+			// The spelled path wins over a case-variant sibling, so a selector
+			// keeps naming one directory instead of widening to both.
+			name:  "exact selector does not widen to a case-variant sibling",
+			all:   []string{"SRC/Keep.go", "src/lower.go"},
+			paths: []string{"src"},
+			want:  []string{"src/lower.go"},
+		},
+		{
+			name:  "exact file selector beats the case-variant twin",
+			all:   []string{"docs/README.md", "DOCS/readme.md"},
+			paths: []string{"docs/README.md"},
+			want:  []string{"docs/README.md"},
+		},
+		{
+			// The fallback is decided per selector: one that exists in its own
+			// spelling does not keep another from folding.
+			name:  "fallback applies per selector",
+			all:   []string{"SRC/Keep.go", "src/lower.go", "main.go"},
+			paths: []string{"src", "MAIN.GO"},
+			want:  []string{"src/lower.go", "main.go"},
+		},
+		{
+			// With no exact spelling anywhere, folding still selects every
+			// case variant: the Windows/macOS repair, pinned as a fallback.
+			name:  "fold selects both case variants when no spelling matches",
+			all:   []string{"SRC/Keep.go", "src/lower.go"},
+			paths: []string{"srC"},
+			want:  []string{"SRC/Keep.go", "src/lower.go"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := filterByPaths(all, tt.paths)
+			got := filterByPaths(tt.all, tt.paths)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("filterByPaths(%q) = %v, want %v", tt.paths, got, tt.want)
+				t.Errorf("filterByPaths(%q) over %q = %v, want %v", tt.paths, tt.all, got, tt.want)
 			}
 		})
-	}
-
-	// Two names that differ only by case fold to the same selector. That is the
-	// same trade-off the other user-facing filters make by lowercasing both
-	// sides everywhere, and it only arises on case-sensitive filesystems, where
-	// holding both names is legal. Pin it so the choice is visible.
-	siblings := []string{"SRC/Keep.go", "src/lower.go"}
-	if got := filterByPaths(siblings, []string{"src"}); !reflect.DeepEqual(got, siblings) {
-		t.Errorf("filterByPaths(%q) = %v, want %v", []string{"src"}, got, siblings)
 	}
 }
 
 // TestProvider_Enumerate_PathSelectorIgnoresCase is the end-to-end repro: on
 // Windows and macOS `--path SRC` names a directory that exists (the filesystem
-// resolves it), but Enumerate compared the selector to `git ls-files` output
-// byte-for-byte, so the scan reported "No files changed." and exited 0 while
-// the same repository scanned fine with the spelled-on-disk case.
+// resolves it), but the selector's own spelling matched no `git ls-files`
+// entry, so the scan reported "No files changed." and exited 0 while the same
+// repository scanned fine with the spelled-on-disk case.
 func TestProvider_Enumerate_PathSelectorIgnoresCase(t *testing.T) {
 	repo := initTestRepo(t)
 	writeFile(t, repo, "main.go", []byte("package main\n"))

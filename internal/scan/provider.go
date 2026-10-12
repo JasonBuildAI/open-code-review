@@ -294,26 +294,46 @@ func (p *Provider) gitLs(ctx context.Context, args ...string) ([]string, error) 
 }
 
 // filterByPaths keeps only entries whose path equals a user-supplied path
-// (for exact files) or lies under it (for directories). Matching ignores case,
-// like every other user-facing path filter in OCR (--include/--exclude, secret
-// paths, the extension allowlist): on Windows and macOS `--path SRC` names an
-// existing directory, and a byte-exact compare would silently select nothing.
+// (for exact files) or lies under it (for directories). The spelled path wins:
+// on a case-sensitive filesystem `--path src` names `src/` even when a sibling
+// `SRC/` exists, so a selector cannot silently widen to another directory.
+// Only a selector that matches no tracked path in its own spelling falls back
+// to case-insensitive matching, like OCR's other user-facing path filters
+// (--include/--exclude, secret paths, the extension allowlist): on Windows and
+// macOS `--path SRC` names an existing directory, and a byte-exact compare
+// alone would silently select nothing.
 func filterByPaths(all []string, paths []string) []string {
-	folded := make([]string, 0, len(paths))
+	keep := make([]bool, len(all))
 	for _, want := range paths {
-		folded = append(folded, strings.ToLower(want))
-	}
-	var out []string
-	for _, f := range all {
-		lower := strings.ToLower(f)
-		for _, want := range folded {
-			if lower == want || strings.HasPrefix(lower, want+"/") {
-				out = append(out, f)
+		exact := false
+		for _, f := range all {
+			if pathMatches(f, want, false) {
+				exact = true
 				break
 			}
 		}
+		for i, f := range all {
+			if pathMatches(f, want, !exact) {
+				keep[i] = true
+			}
+		}
+	}
+	var out []string
+	for i, f := range all {
+		if keep[i] {
+			out = append(out, f)
+		}
 	}
 	return out
+}
+
+// pathMatches reports whether f is want itself or lies under it as a
+// directory. When fold is set, the comparison ignores case.
+func pathMatches(f, want string, fold bool) bool {
+	if fold {
+		f, want = strings.ToLower(f), strings.ToLower(want)
+	}
+	return f == want || strings.HasPrefix(f, want+"/")
 }
 
 // countLines returns the number of lines in content. A file without a
