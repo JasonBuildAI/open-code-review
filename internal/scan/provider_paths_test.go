@@ -7,9 +7,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/alibaba/open-code-review/internal/gitcmd"
@@ -126,16 +126,44 @@ func requireWhitespaceFilenames(t *testing.T) {
 // --path selectors, so a case reads as selector in, file list out.
 func enumeratePaths(t *testing.T, repo string, selectors []string) []string {
 	t.Helper()
-	got, err := NewProvider(repo, selectors, gitcmd.New(2), 0).Enumerate(context.Background())
+	got, err := enumeratePathsErr(t, repo, selectors)
 	if err != nil {
 		t.Fatalf("Enumerate(%q): %v", selectors, err)
 	}
+	return got
+}
+
+// enumeratePathsErr is enumeratePaths for selectors expected to fail, such as
+// a path that names nothing in the working tree.
+func enumeratePathsErr(t *testing.T, repo string, selectors []string) ([]string, error) {
+	t.Helper()
+	got, err := NewProvider(repo, selectors, gitcmd.New(2), 0).Enumerate(context.Background())
 	paths := make([]string, 0, len(got))
 	for _, it := range got {
 		paths = append(paths, it.Path)
 	}
 	sort.Strings(paths)
-	return paths
+	return paths, err
+}
+
+// fsIsCaseInsensitive reports whether the filesystem holding dir folds case,
+// by asking it: one probe name spelled two ways must resolve to one file.
+// Windows and default macOS answer true; a case-sensitive filesystem answers
+// false. Tests that depend on either rule skip on the other side rather than
+// assume an OS, because a case-sensitive macOS volume or a case-sensitive
+// Windows directory would silently invert them.
+func fsIsCaseInsensitive(t *testing.T, dir string) bool {
+	t.Helper()
+	probe := filepath.Join(dir, "case-probe")
+	if err := os.WriteFile(probe, nil, 0o644); err != nil {
+		t.Fatalf("write case probe: %v", err)
+	}
+	// Removed with the helper, before a test can enumerate: a probe left in
+	// the repository would be listed by git ls-files and fail the selection
+	// expectations it exists to guard.
+	defer func() { _ = os.Remove(probe) }()
+	_, err := os.Stat(filepath.Join(dir, "CASE-PROBE"))
+	return err == nil
 }
 
 func pathSelectorRepo(t *testing.T) string {
@@ -222,105 +250,46 @@ func TestProvider_Enumerate_WindowsBackslashSelector(t *testing.T) {
 	}
 }
 
-// TestFilterByPaths_CaseHandling pins the selector rule: a --path selector
-// names a path, so its own spelling wins -- on a case-sensitive filesystem
-// `src` does not also select a sibling `SRC/`. Only a selector that matches no
-// tracked path in its own spelling falls back to matching without regard to
-// case, like OCR's other user-facing path filters (--include/--exclude, secret
-// paths, the extension allowlist). That fallback is what keeps `--path SRC`
-// from silently selecting nothing on Windows and macOS, where the filesystem
-// resolves `SRC` to `src`.
-func TestFilterByPaths_CaseHandling(t *testing.T) {
-	tests := []struct {
-		name  string
-		all   []string
-		paths []string
-		want  []string
-	}{
-		{
-			name:  "directory selector in another case",
-			all:   []string{"README.md", "SRC/Keep.go", "internal/scan/provider.go"},
-			paths: []string{"src"},
-			want:  []string{"SRC/Keep.go"},
-		},
-		{
-			name:  "file selector in another case",
-			all:   []string{"SRC/Keep.go"},
-			paths: []string{"src/keep.go"},
-			want:  []string{"SRC/Keep.go"},
-		},
-		{
-			name:  "mixed-case file selector",
-			all:   []string{"internal/scan/provider.go"},
-			paths: []string{"internal/SCAN/Provider.GO"},
-			want:  []string{"internal/scan/provider.go"},
-		},
-		{
-			name:  "partial name is not a match",
-			all:   []string{"SRC/Keep.go"},
-			paths: []string{"src/kee"},
-			want:  nil,
-		},
-		{
-			name:  "prefix still needs a path boundary",
-			all:   []string{"internal/scan/provider.go"},
-			paths: []string{"internal/sc"},
-			want:  nil,
-		},
-		{
-			name:  "no match",
-			all:   []string{"SRC/Keep.go"},
-			paths: []string{"does/not/exist"},
-			want:  nil,
-		},
-		{
-			// The spelled path wins over a case-variant sibling, so a selector
-			// keeps naming one directory instead of widening to both.
-			name:  "exact selector does not widen to a case-variant sibling",
-			all:   []string{"SRC/Keep.go", "src/lower.go"},
-			paths: []string{"src"},
-			want:  []string{"src/lower.go"},
-		},
-		{
-			name:  "exact file selector beats the case-variant twin",
-			all:   []string{"docs/README.md", "DOCS/readme.md"},
-			paths: []string{"docs/README.md"},
-			want:  []string{"docs/README.md"},
-		},
-		{
-			// The fallback is decided per selector: one that exists in its own
-			// spelling does not keep another from folding.
-			name:  "fallback applies per selector",
-			all:   []string{"SRC/Keep.go", "src/lower.go", "main.go"},
-			paths: []string{"src", "MAIN.GO"},
-			want:  []string{"src/lower.go", "main.go"},
-		},
-		{
-			// With no exact spelling anywhere, folding still selects every
-			// case variant: the Windows/macOS repair, pinned as a fallback.
-			name:  "fold selects both case variants when no spelling matches",
-			all:   []string{"SRC/Keep.go", "src/lower.go"},
-			paths: []string{"srC"},
-			want:  []string{"SRC/Keep.go", "src/lower.go"},
-		},
+// TestProvider_Enumerate_UnknownPathIsAnError pins the difference between an
+// empty selection and a mistyped selector. `--path` names a path, not a search
+// pattern, so a selector the filesystem cannot resolve must fail loudly: the
+// old silent "No files changed." exit 0 made a review that covered nothing
+// look like a clean run.
+func TestProvider_Enumerate_UnknownPathIsAnError(t *testing.T) {
+	repo := pathSelectorRepo(t)
+
+	// `internal/sc` is merely a prefix of `internal/scan/provider.go`, and
+	// `internal/scan/provider` lacks the extension; neither names a path.
+	for _, selector := range []string{"does/not/exist", "internal/sc", "internal/scan/provider"} {
+		got, err := enumeratePathsErr(t, repo, []string{selector})
+		if err == nil {
+			t.Errorf("--path %q enumerated %q, want an error for a path that names nothing", selector, got)
+			continue
+		}
+		if !strings.Contains(err.Error(), selector) {
+			t.Errorf("--path %q error %q should name the selector", selector, err)
+		}
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := filterByPaths(tt.all, tt.paths)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("filterByPaths(%q) over %q = %v, want %v", tt.paths, tt.all, got, tt.want)
-			}
-		})
+
+	// A path that exists but has nothing reviewable stays a clean skip: an
+	// empty directory holds no entries, and git tracks files, not directories.
+	if err := os.MkdirAll(filepath.Join(repo, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got, err := enumeratePathsErr(t, repo, []string{"empty"}); err != nil || len(got) != 0 {
+		t.Errorf("--path empty over an existing empty directory = %q, %v; want no files and no error", got, err)
 	}
 }
 
-// TestProvider_Enumerate_PathSelectorIgnoresCase is the end-to-end repro: on
-// Windows and macOS `--path SRC` names a directory that exists (the filesystem
-// resolves it), but the selector's own spelling matched no `git ls-files`
-// entry, so the scan reported "No files changed." and exited 0 while the same
-// repository scanned fine with the spelled-on-disk case.
-func TestProvider_Enumerate_PathSelectorIgnoresCase(t *testing.T) {
+// TestProvider_Enumerate_CaseVariantSelectorResolvesOnCaseInsensitiveFS is
+// the Windows/macOS repair: `--path SRC` names `src/` because the filesystem
+// resolves the spelling, so the scan selects the tracked spelling instead of
+// reporting "No files changed.".
+func TestProvider_Enumerate_CaseVariantSelectorResolvesOnCaseInsensitiveFS(t *testing.T) {
 	repo := initTestRepo(t)
+	if !fsIsCaseInsensitive(t, repo) {
+		t.Skip("case-variant spellings name different paths on this filesystem")
+	}
 	writeFile(t, repo, "main.go", []byte("package main\n"))
 	writeFile(t, repo, filepath.Join("SRC", "Keep.go"), []byte("package keep\n"))
 	gitCommit(t, repo, "init")
@@ -333,8 +302,82 @@ func TestProvider_Enumerate_PathSelectorIgnoresCase(t *testing.T) {
 		}
 	}
 
-	// Case folding must not turn a non-existent name into a match.
-	if got := enumeratePaths(t, repo, []string{"src/keep"}); len(got) != 0 {
-		t.Errorf("--path src/keep enumerated %q, want no files", got)
+	// Resolution is not fuzziness: a selector the filesystem cannot resolve is
+	// still an error, not an empty selection.
+	if got, err := enumeratePathsErr(t, repo, []string{"src/keep"}); err == nil {
+		t.Errorf("--path src/keep enumerated %q, want an error", got)
+	}
+}
+
+// TestProvider_Enumerate_ExactSpellingWinsOnCaseSensitiveFS pins the rule
+// where case is meaningful: `src` and `SRC` are two paths, the spelled path
+// wins, and a spelling that names neither is an error rather than a folded
+// match of both -- widening to both would silently grow the review and its
+// cost.
+func TestProvider_Enumerate_ExactSpellingWinsOnCaseSensitiveFS(t *testing.T) {
+	repo := initTestRepo(t)
+	if fsIsCaseInsensitive(t, repo) {
+		t.Skip("case-variant spellings are one path on this filesystem")
+	}
+	writeFile(t, repo, "src/lower.go", []byte("package lower\n"))
+	writeFile(t, repo, filepath.Join("SRC", "Keep.go"), []byte("package keep\n"))
+	gitCommit(t, repo, "init")
+
+	for _, tc := range []struct{ selector, want string }{
+		{"src", "src/lower.go"},
+		{"SRC", "SRC/Keep.go"},
+	} {
+		got := enumeratePaths(t, repo, []string{tc.selector})
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("--path %q enumerated %q, want [%q]", tc.selector, got, tc.want)
+		}
+	}
+
+	if got, err := enumeratePathsErr(t, repo, []string{"srC"}); err == nil {
+		t.Errorf("--path srC enumerated %q, want an error, not a folded match of both directories", got)
+	}
+}
+
+// TestProvider_Enumerate_CaseVariantFileNameIsNotFoldedOnCaseSensitiveFS is
+// the same rule at file level: `src/KEEP.go` names no file where `src/keep.go`
+// and `src/Keep.go` both exist, and pooling both cases into one match would
+// review two files the user did not name.
+func TestProvider_Enumerate_CaseVariantFileNameIsNotFoldedOnCaseSensitiveFS(t *testing.T) {
+	repo := initTestRepo(t)
+	if fsIsCaseInsensitive(t, repo) {
+		t.Skip("case-variant spellings are one path on this filesystem")
+	}
+	writeFile(t, repo, "src/keep.go", []byte("package keep\n"))
+	writeFile(t, repo, "src/Keep.go", []byte("package keep\n"))
+	gitCommit(t, repo, "init")
+
+	if got, err := enumeratePathsErr(t, repo, []string{"src/KEEP.go"}); err == nil {
+		t.Errorf("--path src/KEEP.go enumerated %q, want an error", got)
+	}
+}
+
+// TestProvider_Enumerate_ResolvedAliasSelectsTrackedSpelling covers the fold
+// fallback on a case-sensitive filesystem, reached through a path that
+// resolves anyway: `src` is a symlink to the tracked `SRC/`, so the selector
+// must select the tracked spelling even though no byte-exact entry matches.
+// An empty result for a path the user can see would read as "nothing to
+// review".
+func TestProvider_Enumerate_ResolvedAliasSelectsTrackedSpelling(t *testing.T) {
+	repo := initTestRepo(t)
+	if fsIsCaseInsensitive(t, repo) {
+		t.Skip("the alias would collide with the tracked directory on this filesystem")
+	}
+	writeFile(t, repo, ".gitignore", []byte("src\n"))
+	writeFile(t, repo, filepath.Join("SRC", "Keep.go"), []byte("package keep\n"))
+	gitCommit(t, repo, "init")
+
+	if err := os.Symlink("SRC", filepath.Join(repo, "src")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	got := enumeratePaths(t, repo, []string{"src"})
+	want := []string{"SRC/Keep.go"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("--path src through the alias enumerated %q, want %q", got, want)
 	}
 }

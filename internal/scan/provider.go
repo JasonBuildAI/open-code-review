@@ -103,7 +103,10 @@ func (p *Provider) Enumerate(ctx context.Context) ([]model.ScanItem, error) {
 	}
 
 	if len(p.paths) > 0 {
-		files = filterByPaths(files, p.paths)
+		files, err = p.filterByPaths(files)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	gitignorePatterns := diff.LoadGitignorePatterns(p.repoDir)
@@ -293,27 +296,42 @@ func (p *Provider) gitLs(ctx context.Context, args ...string) ([]string, error) 
 	return files, nil
 }
 
-// filterByPaths keeps only entries whose path equals a user-supplied path
-// (for exact files) or lies under it (for directories). The spelled path wins:
-// on a case-sensitive filesystem `--path src` names `src/` even when a sibling
-// `SRC/` exists, so a selector cannot silently widen to another directory.
-// Only a selector that matches no tracked path in its own spelling falls back
-// to case-insensitive matching, like OCR's other user-facing path filters
-// (--include/--exclude, secret paths, the extension allowlist): on Windows and
-// macOS `--path SRC` names an existing directory, and a byte-exact compare
-// alone would silently select nothing.
-func filterByPaths(all []string, paths []string) []string {
+// filterByPaths keeps only entries named by a --path selector: the file
+// itself, or everything under it for a directory.
+//
+// The selector's own spelling is tried first, so on a case-sensitive
+// filesystem `--path src` names `src/` alone even when a sibling `SRC/`
+// exists. Only a selector that names nothing in its own spelling may fold
+// case, and only when the working tree resolves that spelling: on Windows and
+// macOS the filesystem itself resolves `SRC` to `src`, which is the silent
+// zero-file scan the fallback exists to repair.
+//
+// A selector that resolves but matches no enumerated entry (an ignored path,
+// say) stays a clean, empty selection. One the filesystem does not resolve is
+// an error -- `--path` names a path, not a search pattern, so a mistyped or
+// wrongly-cased selector must not pass for a clean scan of zero files.
+func (p *Provider) filterByPaths(all []string) ([]string, error) {
 	keep := make([]bool, len(all))
-	for _, want := range paths {
+	for _, want := range p.paths {
 		exact := false
-		for _, f := range all {
-			if pathMatches(f, want, false) {
+		for i, f := range all {
+			if pathMatches(f, want) {
+				keep[i] = true
 				exact = true
-				break
 			}
 		}
+		if exact {
+			continue
+		}
+		resolves, err := p.selectorResolves(want)
+		if err != nil {
+			return nil, fmt.Errorf("--path %q: %w", want, err)
+		}
+		if !resolves {
+			return nil, fmt.Errorf("--path %q does not exist in the working tree", want)
+		}
 		for i, f := range all {
-			if pathMatches(f, want, !exact) {
+			if pathMatchesFold(f, want) {
 				keep[i] = true
 			}
 		}
@@ -324,16 +342,34 @@ func filterByPaths(all []string, paths []string) []string {
 			out = append(out, f)
 		}
 	}
-	return out
+	return out, nil
+}
+
+// selectorResolves reports whether the working tree holds an entry at the
+// selector's spelling. The filesystem decides what a spelling resolves to:
+// `SRC` finds a directory on disk named `src` on Windows and macOS, and finds
+// nothing on a case-sensitive filesystem.
+func (p *Provider) selectorResolves(want string) (bool, error) {
+	_, err := os.Lstat(filepath.Join(p.repoDir, filepath.FromSlash(want)))
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // pathMatches reports whether f is want itself or lies under it as a
-// directory. When fold is set, the comparison ignores case.
-func pathMatches(f, want string, fold bool) bool {
-	if fold {
-		f, want = strings.ToLower(f), strings.ToLower(want)
-	}
+// directory, so `src` also matches `src/loader.go` but never `srcx.go`.
+func pathMatches(f, want string) bool {
 	return f == want || strings.HasPrefix(f, want+"/")
+}
+
+// pathMatchesFold is pathMatches without regard to case.
+func pathMatchesFold(f, want string) bool {
+	return pathMatches(strings.ToLower(f), strings.ToLower(want))
 }
 
 // countLines returns the number of lines in content. A file without a
