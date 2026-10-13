@@ -269,6 +269,9 @@ func TestProvider_Enumerate_UnknownPathIsAnError(t *testing.T) {
 		if !strings.Contains(err.Error(), selector) {
 			t.Errorf("--path %q error %q should name the selector", selector, err)
 		}
+		if !strings.Contains(err.Error(), "does not exist in the working tree") {
+			t.Errorf("--path %q error %q should say the path does not exist", selector, err)
+		}
 	}
 
 	// A path that exists but has nothing reviewable stays a clean skip: an
@@ -356,12 +359,37 @@ func TestProvider_Enumerate_CaseVariantFileNameIsNotFoldedOnCaseSensitiveFS(t *t
 	}
 }
 
-// TestProvider_Enumerate_ResolvedAliasSelectsTrackedSpelling covers the fold
-// fallback on a case-sensitive filesystem, reached through a path that
-// resolves anyway: `src` is a symlink to the tracked `SRC/`, so the selector
-// must select the tracked spelling even though no byte-exact entry matches.
-// An empty result for a path the user can see would read as "nothing to
-// review".
+// TestProvider_Enumerate_EmptyCaseVariantDirectoryStaysEmpty pins the
+// follow-up from review: `src/docs/` exists as an empty directory while
+// `src/DOCS/` holds tracked files. A selector resolves to the path the
+// working tree holds at its spelling, and that path is matched exactly, so
+// the empty directory selects nothing -- folding the string would have
+// pulled in the sibling the user did not name.
+func TestProvider_Enumerate_EmptyCaseVariantDirectoryStaysEmpty(t *testing.T) {
+	repo := initTestRepo(t)
+	if fsIsCaseInsensitive(t, repo) {
+		t.Skip("case-variant directories are one directory on this filesystem")
+	}
+	writeFile(t, repo, filepath.Join("src", "DOCS", "main.go"), []byte("package docs\n"))
+	gitCommit(t, repo, "init")
+	if err := os.MkdirAll(filepath.Join(repo, "src", "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	got, err := enumeratePathsErr(t, repo, []string{"src/docs"})
+	if err != nil || len(got) != 0 {
+		t.Errorf("--path src/docs over an empty directory = %q, %v; want no files and no error", got, err)
+	}
+	if got := enumeratePaths(t, repo, []string{"src/DOCS"}); len(got) != 1 || got[0] != "src/DOCS/main.go" {
+		t.Errorf("--path src/DOCS enumerated %q, want [src/DOCS/main.go]", got)
+	}
+}
+
+// TestProvider_Enumerate_ResolvedAliasSelectsTrackedSpelling covers
+// resolution through a symlink on a case-sensitive filesystem: `src` is a
+// symlink to the tracked `SRC/`, so resolving the selector follows it to the
+// tracked spelling even though no byte-exact entry matches. An empty result
+// for a path the user can see would read as "nothing to review".
 func TestProvider_Enumerate_ResolvedAliasSelectsTrackedSpelling(t *testing.T) {
 	repo := initTestRepo(t)
 	if fsIsCaseInsensitive(t, repo) {
@@ -379,5 +407,56 @@ func TestProvider_Enumerate_ResolvedAliasSelectsTrackedSpelling(t *testing.T) {
 	want := []string{"SRC/Keep.go"}
 	if len(got) != len(want) || got[0] != want[0] {
 		t.Errorf("--path src through the alias enumerated %q, want %q", got, want)
+	}
+}
+
+// TestProvider_ResolveSelector_RepositoryBoundary covers selectors that
+// resolve to the repository root or outside it: no tracked entry can match
+// the result, so the scan stays a clean skip rather than widening to whatever
+// the spelling points at.
+func TestProvider_ResolveSelector_RepositoryBoundary(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	outside := filepath.Join(dir, "outside")
+	for _, d := range []string{filepath.Join(repo, "src"), outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	p := &Provider{repoDir: repo}
+	for _, tc := range []struct{ selector, want string }{
+		{selector: ".", want: "."},
+		{selector: "src/..", want: "."},
+		{selector: "../outside", want: "../outside"},
+	} {
+		got, err := p.resolveSelector(tc.selector)
+		if err != nil || got != tc.want {
+			t.Errorf("resolveSelector(%q) = %q, %v; want %q and no error", tc.selector, got, err, tc.want)
+		}
+	}
+}
+
+// TestOnDiskName pins the two lookups resolution depends on: an exactly
+// spelled entry is returned as is, and a spelling the filesystem resolves to
+// a differently-cased entry takes that entry's name -- the arm macOS needs,
+// since Windows is already normalised inside EvalSymlinks. On a
+// case-sensitive filesystem the variant names nothing and must error instead
+// of guessing.
+func TestOnDiskName(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "MixedCase"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got, err := onDiskName(dir, "MixedCase"); err != nil || got != "MixedCase" {
+		t.Errorf("onDiskName(exact) = %q, %v; want %q and no error", got, err, "MixedCase")
+	}
+	if fsIsCaseInsensitive(t, dir) {
+		if got, err := onDiskName(dir, "mixedcase"); err != nil || got != "MixedCase" {
+			t.Errorf("onDiskName(case variant) = %q, %v; want %q and no error", got, err, "MixedCase")
+		}
+		return
+	}
+	if got, err := onDiskName(dir, "mixedcase"); err == nil {
+		t.Errorf("onDiskName(case variant) = %q, nil; want an error on a case-sensitive filesystem", got)
 	}
 }

@@ -43,7 +43,6 @@ func TestPathMatches(t *testing.T) {
 		name  string
 		f     string
 		want  string
-		fold  bool
 		match bool
 	}{
 		{name: "exact file", f: "README.md", want: "README.md", match: true},
@@ -52,18 +51,12 @@ func TestPathMatches(t *testing.T) {
 		{name: "prefix not at boundary", f: "internal/agent/agent.go", want: "internal/age"},
 		{name: "partial file name", f: "internal/scan/provider.go", want: "internal/scan/provider"},
 		{name: "other path", f: "README.md", want: "docs"},
-		{name: "folded directory", f: "SRC/Keep.go", want: "src", fold: true, match: true},
-		{name: "folded file name", f: "internal/scan/provider.go", want: "internal/SCAN/Provider.GO", fold: true, match: true},
-		{name: "folded partial name still misses", f: "src/keep.go", want: "src/kee", fold: true},
+		{name: "case variant is a different path", f: "SRC/Keep.go", want: "src"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := pathMatches(tt.f, tt.want)
-			if tt.fold {
-				got = pathMatchesFold(tt.f, tt.want)
-			}
-			if got != tt.match {
-				t.Errorf("path match %q against %q (fold=%v) = %v, want %v", tt.f, tt.want, tt.fold, got, tt.match)
+			if got := pathMatches(tt.f, tt.want); got != tt.match {
+				t.Errorf("pathMatches(%q, %q) = %v, want %v", tt.f, tt.want, got, tt.match)
 			}
 		})
 	}

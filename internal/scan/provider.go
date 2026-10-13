@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -301,14 +302,18 @@ func (p *Provider) gitLs(ctx context.Context, args ...string) ([]string, error) 
 //
 // The selector's own spelling is tried first, so on a case-sensitive
 // filesystem `--path src` names `src/` alone even when a sibling `SRC/`
-// exists. Only a selector that names nothing in its own spelling may fold
-// case, and only when the working tree resolves that spelling: on Windows and
-// macOS the filesystem itself resolves `SRC` to `src`, which is the silent
-// zero-file scan the fallback exists to repair.
+// exists. A selector that names nothing in its own spelling is then resolved
+// against the working tree, which decides what the spelling names: symlinks
+// are followed and, on a case-insensitive filesystem, the answer carries the
+// on-disk case, so `--path SRC` names the tracked `src/` on Windows and
+// macOS. Only the resolved path is matched, and it is matched exactly, so a
+// selector can never widen to a case-variant sibling that the filesystem did
+// not name -- an empty `src/docs/` selects nothing even while `src/DOCS/`
+// holds tracked files.
 //
 // A selector that resolves but matches no enumerated entry (an ignored path,
-// say) stays a clean, empty selection. One the filesystem does not resolve is
-// an error -- `--path` names a path, not a search pattern, so a mistyped or
+// say) stays a clean, empty selection. One the working tree does not resolve
+// is an error -- `--path` names a path, not a search pattern, so a mistyped or
 // wrongly-cased selector must not pass for a clean scan of zero files.
 func (p *Provider) filterByPaths(all []string) ([]string, error) {
 	keep := make([]bool, len(all))
@@ -323,15 +328,15 @@ func (p *Provider) filterByPaths(all []string) ([]string, error) {
 		if exact {
 			continue
 		}
-		resolves, err := p.selectorResolves(want)
+		resolved, err := p.resolveSelector(want)
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil, fmt.Errorf("--path %q does not exist in the working tree", want)
+			}
 			return nil, fmt.Errorf("--path %q: %w", want, err)
 		}
-		if !resolves {
-			return nil, fmt.Errorf("--path %q does not exist in the working tree", want)
-		}
 		for i, f := range all {
-			if pathMatchesFold(f, want) {
+			if pathMatches(f, resolved) {
 				keep[i] = true
 			}
 		}
@@ -345,31 +350,84 @@ func (p *Provider) filterByPaths(all []string) ([]string, error) {
 	return out, nil
 }
 
-// selectorResolves reports whether the working tree holds an entry at the
-// selector's spelling. The filesystem decides what a spelling resolves to:
-// `SRC` finds a directory on disk named `src` on Windows and macOS, and finds
-// nothing on a case-sensitive filesystem.
-func (p *Provider) selectorResolves(want string) (bool, error) {
-	_, err := os.Lstat(filepath.Join(p.repoDir, filepath.FromSlash(want)))
-	switch {
-	case err == nil:
-		return true, nil
-	case os.IsNotExist(err):
-		return false, nil
-	default:
-		return false, err
+// resolveSelector returns the repo-relative path the working tree holds at
+// the selector's spelling, or an error wrapping fs.ErrNotExist when nothing
+// is there. The filesystem decides what resolves: symlinks are followed, and
+// a case-insensitive filesystem answers with the on-disk spelling, so `SRC`
+// names `src/` on Windows and macOS while a case-sensitive filesystem keeps
+// the two apart. The result feeds exact matching, never folding, so a
+// resolved selector cannot also drag in a case-variant sibling.
+func (p *Provider) resolveSelector(want string) (string, error) {
+	root, err := filepath.EvalSymlinks(p.repoDir)
+	if err != nil {
+		return "", err
 	}
+	real, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(want)))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, real)
+	if err != nil {
+		return "", err
+	}
+	rel = filepath.ToSlash(rel)
+	// A selector can leave the repository through `..` or an absolute path;
+	// nothing tracked can match, and the clean skip stays.
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return rel, nil
+	}
+	// EvalSymlinks normalises case on Windows but not on macOS, where the
+	// on-disk spelling of every component still has to come from the
+	// directory listing.
+	resolved := ""
+	for _, part := range strings.Split(rel, "/") {
+		name, err := onDiskName(filepath.Join(root, filepath.FromSlash(resolved)), part)
+		if err != nil {
+			return "", err
+		}
+		if resolved == "" {
+			resolved = name
+			continue
+		}
+		resolved += "/" + name
+	}
+	return resolved, nil
+}
+
+// onDiskName returns the name of the directory entry under dir that the
+// filesystem resolves as name, preferring an entry spelled exactly. The
+// listing is consulted because on macOS EvalSymlinks keeps the caller's case
+// even where the filesystem matched a differently-cased entry.
+func onDiskName(dir, name string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.Name() == name {
+			return name, nil
+		}
+	}
+	info, err := os.Lstat(filepath.Join(dir, name))
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		ei, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if os.SameFile(ei, info) {
+			return e.Name(), nil
+		}
+	}
+	return "", fmt.Errorf("%s: no directory entry resolves %q", dir, name)
 }
 
 // pathMatches reports whether f is want itself or lies under it as a
 // directory, so `src` also matches `src/loader.go` but never `srcx.go`.
 func pathMatches(f, want string) bool {
 	return f == want || strings.HasPrefix(f, want+"/")
-}
-
-// pathMatchesFold is pathMatches without regard to case.
-func pathMatchesFold(f, want string) bool {
-	return pathMatches(strings.ToLower(f), strings.ToLower(want))
 }
 
 // countLines returns the number of lines in content. A file without a
