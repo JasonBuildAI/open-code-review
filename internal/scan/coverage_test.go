@@ -1080,6 +1080,96 @@ func TestDispatchSubtasks_GraceRoundLimitVisibleWithZeroFindings(t *testing.T) {
 	}
 }
 
+func TestDispatchSubtasks_GraceRoundMixedTaskDoneNotCheckpointed(t *testing.T) {
+	limits := []struct {
+		name            string
+		maxToolRequests int
+		tokenBudget     int64
+	}{
+		{name: "max_tool_requests", maxToolRequests: 1},
+		{name: "token_budget", maxToolRequests: 5, tokenBudget: 30_000},
+	}
+	for _, limit := range limits {
+		for _, states := range [][]string{{"DONE", "FAILED"}, {"FAILED", "DONE"}} {
+			t.Run(limit.name+"/"+strings.Join(states, "_then_"), func(t *testing.T) {
+				testHome := t.TempDir()
+				t.Setenv("HOME", testHome)
+				t.Setenv("USERPROFILE", testHome)
+				repoDir := t.TempDir()
+				item := model.ScanItem{Path: "a.go", Content: "package a\nfunc f() {}\n", LineCount: 2}
+				tpl := makeTemplateWithFullScan()
+				tpl.MaxTokens = 100000
+				tpl.MaxToolRequestTimes = limit.maxToolRequests
+
+				collector := tool.NewCommentCollector()
+				registry := tool.NewRegistry()
+				registry.Register(&tool.CodeCommentProvider{Collector: collector})
+				registry.Register(tool.NewFileReadDiff(tool.DiffMap{}))
+				registry.Freeze()
+
+				var calls []llm.ToolCall
+				for _, state := range states {
+					calls = append(calls, llm.ToolCall{
+						ID: state, Type: "function",
+						Function: llm.FunctionCall{Name: "task_done", Arguments: `{"state":"` + state + `"}`},
+					})
+				}
+				client := &fakeScanClient{responses: []*llm.ChatResponse{
+					{
+						Choices: []llm.Choice{{Message: llm.ResponseMessage{ToolCalls: []llm.ToolCall{{
+							ID: "read", Type: "function",
+							Function: llm.FunctionCall{Name: "file_read_diff", Arguments: `{"path_array":["a.go"]}`},
+						}}}}},
+						Usage: &llm.UsageInfo{PromptTokens: 40_000},
+					},
+					{Choices: []llm.Choice{{Message: llm.ResponseMessage{ToolCalls: calls}}}},
+				}}
+				agent := NewAgent(Args{
+					Template:  tpl,
+					LLMClient: client,
+					Model:     "test",
+					Tools:     registry,
+					MainToolDefs: []llm.ToolDef{
+						{Type: "function", Function: llm.FunctionDef{Name: "file_read_diff"}},
+						{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}},
+						{Type: "function", Function: llm.FunctionDef{Name: "task_done"}},
+					},
+					CommentCollector: collector,
+					MaxTokensBudget:  limit.tokenBudget,
+					MaxConcurrency:   1,
+					SkipPlan:         true,
+					SkipDedup:        true,
+					SkipSummary:      true,
+					RepoDir:          repoDir,
+					Session: session.New(repoDir, "main", "test", session.SessionOptions{
+						ReviewMode: session.ReviewModeFullScan,
+					}),
+				})
+				agent.items = []model.ScanItem{item}
+				agent.currentDate = "2026-06-26"
+				agent.injectScanContentMap()
+
+				if _, err := agent.dispatchSubtasks(context.Background()); err == nil || !strings.Contains(err.Error(), "all 1 file scan(s) failed") {
+					t.Errorf("dispatchSubtasks error = %v, want the single file to fail", err)
+				}
+				if client.calls != 2 {
+					t.Errorf("LLM calls = %d, want 2 (1 main + 1 grace)", client.calls)
+				}
+				if err := agent.Session().Finalize(); err != nil {
+					t.Fatalf("finalize session: %v", err)
+				}
+				resumeState, err := session.LoadResumeState(repoDir, agent.SessionID())
+				if err != nil {
+					t.Fatalf("LoadResumeState: %v", err)
+				}
+				if _, ok := resumeState.Item(scanItemFingerprint(item)); ok {
+					t.Error("a failed grace round must not leave a reusable completion checkpoint")
+				}
+			})
+		}
+	}
+}
+
 func TestPhaseEnabled(t *testing.T) {
 	tpl := makeTemplateWithFullScan()
 	a := newAgentForTest(t, tpl)

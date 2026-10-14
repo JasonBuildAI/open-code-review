@@ -846,6 +846,86 @@ func TestRunMainTask_GraceRoundTaskDoneFailedStaysIncomplete(t *testing.T) {
 	}
 }
 
+func TestRunMainTask_GraceRoundCompletionStates(t *testing.T) {
+	limits := []struct {
+		name            string
+		maxToolRequests int
+		tokenBudget     int64
+		wantStop        MainLoopStop
+	}{
+		{name: "max_tool_requests", maxToolRequests: 1, wantStop: StopMaxRounds},
+		{name: "token_budget", maxToolRequests: 5, tokenBudget: 500, wantStop: StopTokenBudget},
+	}
+	cases := []struct {
+		name          string
+		states        []string
+		wantCompleted bool
+	}{
+		{name: "done", states: []string{"DONE"}, wantCompleted: true},
+		{name: "failed", states: []string{"FAILED"}},
+		{name: "done_then_failed", states: []string{"DONE", "FAILED"}},
+		{name: "failed_then_done", states: []string{"FAILED", "DONE"}},
+		{name: "no_task_done"},
+	}
+	for _, limit := range limits {
+		for _, testCase := range cases {
+			t.Run(limit.name+"/"+testCase.name, func(t *testing.T) {
+				var calls []llm.ToolCall
+				for _, state := range testCase.states {
+					calls = append(calls, llm.ToolCall{
+						ID: state, Type: "function",
+						Function: llm.FunctionCall{Name: "task_done", Arguments: `{"state":"` + state + `"}`},
+					})
+				}
+				response := graceRoundCommentResponse()
+				response.Choices[0].Message.ToolCalls = append(calls, response.ToolCalls()...)
+				client := &fakeClient{responses: []*llm.ChatResponse{
+					withUsage(fileReadToolCallResponse("read", `{"path":"main.go"}`), 600),
+					response,
+				}}
+				deps := newTestDeps(client)
+				deps.Template.MaxToolRequestTimes = limit.maxToolRequests
+				deps.MaxTokensBudget = limit.tokenBudget
+				deps.Tools.Register(&tool.CodeCommentProvider{Collector: deps.CommentCollector})
+				deps.MainToolDefs = []llm.ToolDef{
+					{Type: "function", Function: llm.FunctionDef{Name: "file_read"}},
+					{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}},
+					{Type: "function", Function: llm.FunctionDef{Name: "task_done"}},
+				}
+				runner := NewRunner(deps)
+
+				completed, stop, err := runner.RunMainTask(context.Background(),
+					[]llm.Message{llm.NewTextMessage("user", "review")}, "main.go")
+				if err != nil {
+					t.Fatalf("RunMainTask: %v", err)
+				}
+				if completed != testCase.wantCompleted {
+					t.Errorf("completed = %v, want %v", completed, testCase.wantCompleted)
+				}
+				if stop != limit.wantStop {
+					t.Errorf("stop = %v, want %v", stop, limit.wantStop)
+				}
+				if client.calls != 2 {
+					t.Errorf("LLM calls = %d, want 2 (1 main + 1 grace)", client.calls)
+				}
+				comments := deps.CommentCollector.Comments()
+				if len(comments) != 1 || comments[0].Path != "main.go" || comments[0].Content != "found a bug" {
+					t.Errorf("comments = %+v, want the finding submitted after task_done", comments)
+				}
+				outcome := "the grace round did not complete the task"
+				if testCase.wantCompleted {
+					outcome = "the grace round completed the task"
+				}
+				warnings := graceLimitWarnings(runner)
+				if len(warnings) != 1 || warnings[0].File != "main.go" ||
+					warnings[0].Message != limit.wantStop.Reason()+"; "+outcome {
+					t.Errorf("limit warnings = %+v, want one warning with verdict %q", warnings, outcome)
+				}
+			})
+		}
+	}
+}
+
 func TestRunMainTask_GraceRoundSkippedWhenContextCancelled(t *testing.T) {
 	client := &fakeClient{responses: []*llm.ChatResponse{
 		fileReadToolCallResponse("call_1", `{"path":"main.go"}`),

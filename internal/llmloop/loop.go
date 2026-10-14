@@ -622,13 +622,14 @@ func (r *Runner) runGraceRound(ctx context.Context, messages []llm.Message, task
 	// Only task_done reports completion; code_comment records findings. A FAILED
 	// task_done is neither, so the round stays incomplete.
 	completed := false
+	failed := false
 	thinking := resp.ReasoningContent()
 	for _, call := range calls {
-		if cp := r.executeToolCall(ctx, taskKey, call, rec, thinking); cp.Completed {
-			completed = true
-		}
+		checkpoint := r.executeToolCall(ctx, taskKey, call, rec, thinking)
+		completed = completed || checkpoint.Completed
+		failed = failed || checkpoint.Failed
 	}
-	return completed
+	return completed && !failed
 }
 
 // WarningReviewLimitReached is the warning type RunMainTask records when a
